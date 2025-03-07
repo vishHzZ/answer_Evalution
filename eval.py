@@ -6,6 +6,13 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from fpdf import FPDF
 import re
+import fitz  # PyMuPDF for reading PDFs
+import re
+from rapidfuzz import fuzz
+import os
+import io
+import PyPDF2
+from PyPDF2 import PdfReader
 
 # Database configuration
 host = "82.180.143.66"
@@ -89,7 +96,7 @@ def adminLogin():
         # Horizontal radio buttons
         selected_option = st.radio(
             "Select Data to View:",
-            ["Students", "Teachers","Check Marks"],
+            ["Students", "Teachers","UpdateProfile", "Check Marks"],
             horizontal=True,
             key="admin_view"
         )
@@ -151,9 +158,10 @@ def RegisterUser():
                         st.warning("Mobile number must be 10 digits!")
                     else:
                         insert_teacher(name, mail, mobile, password, branch)
-                else:
-                    st.warning("Please fill all the fields!")
-        
+                        st.session_state.registered_email = mail
+                        st.session_state.registered_password = password
+                        st.session_state.page = "login"  # Redirect to login page
+                        st.rerun()                        
         elif registration_type == "Student":
             name = st.text_input("Name")
             enrolment = st.text_input("Enrolment Number")
@@ -171,11 +179,16 @@ def RegisterUser():
                         st.warning("Mobile number must be 10 digits!")
                     else:
                         insert_student(name, enrolment, mail, mobile, password, branch)
+                        st.session_state.registered_email = mail
+                        st.session_state.registered_password = password
+                        st.session_state.page = "login"  # Redirect to login page
+                        st.rerun()                                            
+
                 else:
                     st.warning("Please fill all the fields!")
 
 def is_valid_email(email):
-    pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+    pattern = r'^[\w\.-]+@[\w\.-]+\.(com|in|org|edu|ac\.in)$'
     return re.match(pattern, email) is not None
 
 def is_valid_mobile(mobile):
@@ -255,41 +268,200 @@ def insert_student(name, enrolment, mail, mobile, password, branch):
             cur.close()
         if db:
             db.close()
-def evaluate_answers(correct_answers, student_answers):
-    vectorizer = TfidfVectorizer()
-    marks_obtained = []
-    
-    for index, row in student_answers.iterrows():
-        question_id = row['Question']
-        student_answer = row['Answers']
+# Function to extract text from PDF
+def extract_text_from_pdf(pdf_file):
+    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text("text") + "\n"
+    return text
 
-        correct_answer_row = correct_answers[correct_answers['Question'] == question_id]
-        if correct_answer_row.empty:
-            marks_obtained.append(0)
-            continue
+# Function to extract roll number
+def extract_roll_number(text):
+    match = re.search(r'Roll Number:\s*(\d+)', text)
+    return match.group(1) if match else "Unknown"
+
+# Function to extract questions and answers
+def extract_questions_answers(pdf_text):
+    lines = pdf_text.split("\n")
+    questions, answers = [], []
+    current_question, current_answer = None, ""
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith("Q "):
+            if current_question:
+                questions.append(current_question)
+                answers.append(current_answer.strip())
+            current_question = line
+            current_answer = ""
+        elif current_question:
+            current_answer += " " + line
+
+    if current_question:
+        questions.append(current_question)
+        answers.append(current_answer.strip())
+    return questions, answers
+
+# Function to extract question number
+def extract_question_number(question):
+    match = re.search(r'Q\s?\d+', question)
+    if match:
+        q_number = match.group(0).replace(" ", "")
+        question_text = re.sub(r'Q\s?\d+', '', question).strip()
+        return q_number, question_text
+    return None, question
+
+# Function to clean answers
+def clean_answer_column(answer):
+    return str(answer).replace('Answer: ', '').strip() if answer else ""
+
+# Function to calculate similarity
+def calculate_similarity(answer1, answer2):
+    return fuzz.ratio(str(answer1), str(answer2)) if answer1 and answer2 else 0
+
+# Function to assign marks
+def assign_marks(similarity, total_marks):
+    if similarity >= 90:
+        return total_marks
+    elif similarity >= 70:
+        return total_marks * 0.75
+    elif similarity >= 50:
+        return total_marks * 0.50
+    else:
+        return 0
+
+# Function to process a single student's PDF and evaluate answers
+def process_student_pdf(correct_answers_file, student_pdf):
+    try:
+        # Load correct answers
+        correct_answers = pd.read_excel(correct_answers_file)
         
-        correct_answer = correct_answer_row['Answer'].values[0]
-        max_marks = correct_answer_row['Marks'].values[0]
+        # Process student answers
+        pdf_text = extract_text_from_pdf(student_pdf)
+        questions, answers = extract_questions_answers(pdf_text)
+        roll_number = extract_roll_number(pdf_text)
         
-        combined_text = [correct_answer, student_answer]
-        vectors = vectorizer.fit_transform(combined_text)
-        similarity = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
-        
-        if similarity > 0.9:
-            assigned_marks = max_marks
-        elif similarity > 0.75:
-            assigned_marks = max_marks * 0.9
-        elif similarity > 0.5:
-            assigned_marks = max_marks * 0.75
-        elif similarity > 0.3:
-            assigned_marks = max_marks * 0.5
+        student_answers = pd.DataFrame({'Question': questions, 'Answers': answers})
+        student_answers[['No', 'Question']] = student_answers['Question'].apply(lambda x: pd.Series(extract_question_number(x)))
+        student_answers['Answers'] = student_answers['Answers'].apply(clean_answer_column)
+
+        # Ensure 'No' column exists in correct answers
+        if 'No' not in correct_answers.columns:
+            st.error("❌ The uploaded correct answers file is missing a 'No' column.")
+            return None
         else:
-            assigned_marks = max_marks * similarity
+            # Merge and compute similarity
+            df_merged = pd.merge(student_answers, correct_answers, on='No', suffixes=('_student', '_correct'), how="inner")
 
-        marks_obtained.append(int(np.ceil(assigned_marks)))
+            # Handle missing columns gracefully
+            if "Answers_student" not in df_merged.columns:
+                df_merged.rename(columns={"Answers": "Answers_student"}, inplace=True)
+
+            df_merged['Similarity (%)'] = df_merged.apply(
+                lambda row: calculate_similarity(row.get('Answers_student', ''), row.get('Answers_correct', '')),
+                axis=1
+            )
+            df_merged['Assigned Marks'] = df_merged.apply(
+                lambda row: assign_marks(row['Similarity (%)'], row['Marks']),
+                axis=1
+            )
+
+            # Compute total marks
+            total_marks_obtained = df_merged['Assigned Marks'].sum()
+            total_possible_marks = correct_answers['Marks'].sum()
+
+            return roll_number, df_merged, total_marks_obtained, total_possible_marks
+
+    except Exception as e:
+        st.error(f"🚨 Error processing files: {e}")
+        return None
+
+def insert_student_result(roll_number, subject, marks):
     
-    student_answers['Marks_Obtained'] = marks_obtained
-    return student_answers
+    cursor = None  # Initialize cursor to None
+    try:
+        # Connect to the database
+        connection = mysql.connector.connect(
+            host="82.180.143.66",
+            user="u263681140_students",
+            password="testStudents@123",
+            database="u263681140_students"
+        )
+        
+        # Create a cursor object
+        cursor = connection.cursor()
+        #subject = "Cloud Computing"
+        # SQL query to insert data
+        query = """
+        INSERT INTO StudentResult (RollNumber, Subject, Marks) 
+        VALUES (%s, %s, %s)
+        """
+        marks = int(marks)
+        # Prepare the data to be inserted
+        data = (roll_number, subject, marks)
+
+        # Execute the query
+        cursor.execute(query, data)
+
+        # Commit the transaction
+        connection.commit()
+
+    except mysql.connector.Error as err:
+        st.write(f"Error: {err}")
+    finally:
+        # Close the cursor and connection only if cursor was created
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+def extract_subject_from_pdf(uploaded_file):
+    pdf_reader = PdfReader(uploaded_file)
+    for page in pdf_reader.pages:
+        text = page.extract_text()
+        if text:
+            for line in text.split("\n"):
+                if line.strip().startswith("Subject:"):
+                    return line.split(":")[1].strip()
+    return None
+
+
+def main1():
+    # File upload inputs
+    correct_answers_file = st.file_uploader("Upload Correct Answers File", type="xlsx")
+    student_pdfs = st.file_uploader("Upload Student PDF Files", type="pdf", accept_multiple_files=True)
+
+    if correct_answers_file and student_pdfs:
+        all_results = []
+
+        # Process each student PDF
+        for student_pdf in student_pdfs:
+            result = process_student_pdf(correct_answers_file, student_pdf)
+            if result:
+                roll_number, df_merged, total_marks_obtained, total_possible_marks = result
+                all_results.append({
+                    "Roll Number": roll_number,
+                    "Total Marks Obtained": total_marks_obtained,
+                    "Total Possible Marks": total_possible_marks,
+                    "Details": df_merged
+                })
+                sub = extract_subject_from_pdf(student_pdf)
+                st.write("Subject is: ", sub)
+                insert_student_result(roll_number,sub, total_marks_obtained)
+                
+
+        # Display results for all students
+        for result in all_results:
+            st.subheader(f"📌 Roll Number: {result['Roll Number']}")
+            st.write(f"### ✅ Total Marks: {result['Total Marks Obtained']:.2f} / {result['Total Possible Marks']:.2f}")
+            st.dataframe(result["Details"])
+
+            # Save and download individual results
+            output_file = f"{result['Roll Number']}_graded_answers.csv"
+            result["Details"].to_csv(output_file, index=False)
+            st.download_button(f"⬇️ Download Results for {result['Roll Number']}", data=open(output_file, "rb"), file_name=output_file, mime="text/csv")
+
 
 def check_teacher_login(email, password):
     try:
@@ -327,28 +499,12 @@ def check_admin_login(email, password):
 
 # -------------------- DASHBOARDS --------------------
 def teacher_dashboard():
-    st.title("📊 Teacher Dashboard")
+    main1()    
     if st.button("🔴 Logout"):
         st.session_state.update({"page": "login", "logged_in": False})
         st.rerun()
-
-    correct_file = st.file_uploader("Upload Correct Answers CSV", type=["csv"])
-    student_file = st.file_uploader("Upload Student Answers CSV", type=["csv"])
     
-    if correct_file and student_file:
-        correct_answers = pd.read_csv(correct_file)
-        student_answers = pd.read_csv(student_file)
-        
-        results = evaluate_answers(correct_answers, student_answers)
-        total_marks = results['Marks_Obtained'].sum()
-        max_marks = correct_answers['Marks'].sum()
-        
-        st.subheader("Evaluation Results")
-        st.dataframe(results[['Question', 'Answers', 'Marks_Obtained']])
-        st.markdown(f"**Total Marks: {total_marks}/{max_marks}**")
-        
-        csv = results.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Results", csv, "results.csv", "text/csv")
+
 def fetch_student_info(email):
 
     """Fetch student information from database using email"""
@@ -376,13 +532,67 @@ def fetch_student_info(email):
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+def read_student_results():
+    try:
+        # Connect to the database
+        connection = mysql.connector.connect(
+            host="82.180.143.66",
+            user="u263681140_students",
+            password="testStudents@123",
+            database="u263681140_students"
+        )
+        
+        # Create a cursor object
+        cursor = connection.cursor()
+
+        # SQL query to select all data from StudentResult table
+        query = "SELECT * FROM StudentResult"
+
+        # Execute the query
+        cursor.execute(query)
+
+        # Fetch all records from the table
+        records = cursor.fetchall()
+
+        # Fetch column names dynamically
+        column_names = [i[0] for i in cursor.description]  # Get column names from DB
+
+        # Debugging: print records and column names
+        print(f"Fetched Records: {records}")
+        print(f"Column Names from DB: {column_names}")
+
+        # Check if records are empty
+        if not records:
+            st.warning("No records found in the database.")
+            return pd.DataFrame(columns=column_names)  # Return an empty dataframe
+
+        # Create a Pandas DataFrame using dynamic column names
+        df = pd.DataFrame(records, columns=column_names)
+
+        return df
+
+    except mysql.connector.Error as err:
+        st.error(f"Database Error: {err}")
+        return pd.DataFrame()
+
+    except ValueError as ve:
+        st.error(f"Data Processing Error: {ve}")
+        return pd.DataFrame()
+
+    finally:
+        # Close the cursor and connection
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
 def adminDashboard():
     #st.title("👑 Administrator Dashboard")
 
     # Horizontal radio buttons for navigation
     selected_option = st.radio(
         "Select Data to View:",
-        ["Result Details", "Teacher Details", "Student Details"],
+        ["Result Details", "Teacher Details", "Student Details", "Update Profile"],
         horizontal=True,
         key="admin_view"
     )
@@ -390,12 +600,11 @@ def adminDashboard():
     if selected_option == "Result Details":
         st.subheader("📊 Result Records")
         result_data =0
-        #result_data = fetch_data("results")  # Assuming you have a 'results' table
-        if result_data:
-            df = pd.DataFrame(result_data)
-            st.dataframe(df)
+        df_results = read_student_results()
+        if df_results is not None:
+            st.dataframe(df_results)
         else:
-            st.warning("No result data found in the database.")
+            st.write("No student results found in the database.")
 
     elif selected_option == "Teacher Details":
         st.subheader("👩🏫 Teacher Records")
@@ -414,7 +623,65 @@ def adminDashboard():
             st.dataframe(df)
         else:
             st.warning("No student data found in the database.")
+    elif selected_option == "Update Profile":
+        st.subheader("👩🏫 Update Teaher/Student Profile")
+        branches = [
+        "Computer Science", 
+        "Mechanical Engineering", 
+        "Electrical Engineering", 
+        "Civil Engineering", 
+        "Electronics and Communication", 
+        "Information Technology",
+        "Chemical Engineering", 
+        "Aerospace Engineering"
+        ]
 
+        user_type = st.radio("Select Profile Type to Update:", ["Student", "Teacher"])
+        if user_type == "Teacher":
+            email = st.text_input("Enter Email to Update Profile:")
+            name = st.text_input("Name")
+            mobile = st.text_input("Mobile Number")
+            password = st.text_input("Password", type="password")
+            branch = st.selectbox("Branch", branches)     
+            #submitted = st.form_submit_button("Update Teacher")            
+        elif user_type == "Student":
+            email = st.text_input("Enter Email to Update Profile:")
+            name = st.text_input("Name")
+            mobile = st.text_input("Mobile Number")
+            password = st.text_input("Password", type="password")
+            branch = st.selectbox("Branch", branches) 
+            #submitted = st.form_submit_button("Update Student")
+        if st.button("Update Profile"):
+            if email and mobile and name and password and branch:
+                try:
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    if len(mobile) == 10:
+                        if user_type == "Student":
+                            update_query = "UPDATE students SET name = %s, mobile = %s, password = %s,branch = %s WHERE email = %s"
+                        else:
+                            update_query = "UPDATE teacher SET name = %s, mobile = %s, password = %s,branch = %s WHERE mail = %s"
+        
+                        cursor.execute(update_query, (name, mobile, password, branch, email))
+                        
+                        conn.commit()
+        
+                        if cursor.rowcount > 0:
+                            st.success(f"{user_type} Profile Updated Successfully!")
+                        else:
+                            st.warning(f"No {user_type} found with this email.")
+        
+                        cursor.close()
+                        conn.close()
+                    else:
+                        st.warning(f" invalid mobile number.")
+                    
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            else:
+                st.warning("Please fill all fields before updating.")
+    
+             
 def admin_dashboard():
     st.title("👑 Admin Dashboard")
     adminDashboard()
@@ -433,7 +700,33 @@ def HomePage():
             &copy; 2025 Automated Answer Evaluation System. All Rights Reserved.
         </div>
     """, unsafe_allow_html=True)
-# -------------------- MAIN PAGE TABS --------------------
+def fetch_marks_subject(rno):
+    # Establish the connection to the database
+    connection = get_db_connection()
+
+    # Create a cursor object to interact with the database
+    cursor = connection.cursor()
+
+    # SQL query to select Marks and Subject where RollNumber = rno
+    query = "SELECT Marks, Subject FROM StudentResult WHERE RollNumber = %s"
+
+    # Execute the query with the given RollNumber
+    cursor.execute(query, (rno,))
+
+    # Fetch all rows from the result of the query
+    results = cursor.fetchall()
+
+    # Close the cursor and connection
+    cursor.close()
+    connection.close()
+
+    if results:
+        # Convert results to DataFrame with column names
+        df = pd.DataFrame(results, columns=["Marks", "Subject"])
+        st.table(df)
+    else:
+        st.info("Marks details will be displayed here once available.")
+
 def login_page():
     st.title("📚 Automated Answer Evaluation System")
     tab1, tab2, tab3, tab4 = st.tabs(["Home","Login", "Signup", "Admin Login"])
@@ -449,7 +742,8 @@ def login_page():
         with col2:
             st.header("User Login")
             login_type = st.selectbox("Select Role", ["Teacher", "Student"], key="login_role")
-            
+            prefilled_email = st.session_state.get("registered_email", "")
+            prefilled_password = st.session_state.get("registered_password", "")
             with st.form("login_form"):
                 global global_var
                 email = st.text_input("Email")
@@ -477,6 +771,7 @@ def login_page():
 
     with tab3:
         RegisterUser()
+
     with tab4:
         #st.header("Administrator Login")
         adminLogin()
@@ -500,9 +795,6 @@ if(__name__ == "__main__"):
         #st.write("Well Come:", email)
         student_info = fetch_student_info(email)
         if student_info:
-            st.subheader("Student Dashboard")
-            
-            # Create radio buttons for navigation
             selected_tab = st.radio("Select View", ["Profile", "Marks"], horizontal=True)
             
             if selected_tab == "Profile":
@@ -526,7 +818,8 @@ if(__name__ == "__main__"):
                 
             else:
                 st.write("### Marks Information")
-                st.info("Marks details will be displayed here once available")
+                fetch_marks_subject(student_info['enrolment'])
+                #st.info("Marks details will be displayed here once available")
             if st.button("🔴 Logout"):
                 st.session_state.update({"page": "login", "logged_in": False})
                 st.rerun()
