@@ -1,3 +1,4 @@
+
 streamlit
 mysql-connector-python
 streamlit-option-menu
@@ -5,4 +6,7 @@ pandas
 numpy
 scikit-learn
 fpdf
-fitz
+pymupdf
+rapidfuzz
+openpyxl
+PyPDF2
