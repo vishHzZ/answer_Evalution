@@ -462,6 +462,16 @@ def main1():
                     sub = extract_subject_from_pdf(student_pdf)
                     st.write("Subject is: ", sub)
                     insert_student_result(roll_number, sub, total_marks_obtained)
+                    # Add total marks to each row
+                    total_row = {
+                        col: "" for col in df_merged.columns
+                    }
+                    total_row[df_merged.columns[0]] = "Total"  # Assuming first column is something like 'Question'
+                    total_row["Marks Obtained"] = total_marks_obtained
+                    total_row["Marks"] = total_possible_marks
+                    
+                    # Append total row to DataFrame
+                    df_merged = pd.concat([df_merged, pd.DataFrame([total_row])], ignore_index=True)
                     
                     # Save individual results to CSV and add to ZIP
                     output_file = f"{roll_number}_graded_answers.csv"
